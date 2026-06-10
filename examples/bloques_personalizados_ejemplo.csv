@@ -1,0 +1,6 @@
+block;categories;sexes
+General Infantil y Cadete;infantil,cadete;femenina,masculina,mixta
+General Benjamin y Alevin;benjamin,alevin;femenina,masculina,mixta
+General Femenina;*;femenina
+General Masculina;*;masculina
+General Mixta;*;mixta
