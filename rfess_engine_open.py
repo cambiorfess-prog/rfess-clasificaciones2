@@ -104,8 +104,27 @@ def detect_sex(division: str) -> str:
 
 
 def detect_is_team(division: str, division_team_value=None) -> bool:
+    """Detecta si una prueba es de equipo/relevo.
+
+    Importante: cuando el CSV no trae columna Division_team, pandas rellena
+    ese campo como pd.NA. En versiones anteriores, str(pd.NA) == "<NA>"
+    se interpretaba por error como un valor real y todas las pruebas
+    individuales quedaban marcadas como equipo.
+    """
     d = norm_text(division)
-    if division_team_value is not None and str(division_team_value).strip() and str(division_team_value).lower() != "nan":
+    has_real_division_team = False
+    if division_team_value is not None:
+        try:
+            import pandas as pd
+            if pd.isna(division_team_value):
+                has_real_division_team = False
+            else:
+                v = str(division_team_value).strip()
+                has_real_division_team = bool(v and v.lower() not in {"nan", "none", "<na>"})
+        except Exception:
+            v = str(division_team_value).strip()
+            has_real_division_team = bool(v and v.lower() not in {"nan", "none", "<na>"})
+    if has_real_division_team:
         return True
     return any(k in d for k in TEAM_KEYWORDS)
 
@@ -124,6 +143,8 @@ def normalize_liveheats(df: pd.DataFrame, aliases: Optional[Dict[str, str]] = No
     event_team_col = cols.get("event team") or cols.get("event_team") or cols.get("club team") or cols.get("club")
     bib_col = cols.get("bib") or cols.get("dorsal")
     place_col = cols.get("place") or cols.get("posicion") or cols.get("posicion") or cols.get("pos")
+    round_col = cols.get("round") or cols.get("ronda") or cols.get("fase")
+    heat_col = cols.get("heat") or cols.get("serie") or cols.get("manga")
 
     points_col = None
     for k, v in cols.items():
@@ -146,6 +167,9 @@ def normalize_liveheats(df: pd.DataFrame, aliases: Optional[Dict[str, str]] = No
     out["division_team"] = df[division_team_col] if division_team_col else pd.NA
     out["event_team"] = df[event_team_col] if event_team_col else out["division_team"]
     out["bib"] = df[bib_col] if bib_col else pd.NA
+    out["round"] = df[round_col].astype(str) if round_col else ""
+    out["heat"] = df[heat_col] if heat_col else pd.NA
+    out["has_round_col"] = bool(round_col)
     out["place"] = pd.to_numeric(df[place_col], errors="coerce")
     out["liveheats_points"] = pd.to_numeric(df[points_col], errors="coerce") if points_col else pd.NA
     out["has_liveheats_points_col"] = bool(points_col)
@@ -158,6 +182,69 @@ def normalize_liveheats(df: pd.DataFrame, aliases: Optional[Dict[str, str]] = No
     out.loc[out["club"].str.lower().isin(["nan", "none"]), "club"] = ""
     out["entity"] = out["athlete"].fillna("").astype(str).str.strip()
     return out
+
+
+def is_final_round_value(value) -> bool:
+    """Detecta si una fila de LiveHeats pertenece a una final real.
+
+    Importante: "Semifinal" contiene la palabra "final", por eso no vale
+    buscar simplemente "final". Esta función excluye semifinales, cuartos,
+    series y mangas, y acepta Final, Final A, A Final, etc.
+    """
+    s = norm_text(value)
+    if not s or s in {"nan", "none"}:
+        return False
+    non_final_tokens = [
+        "semifinal", "semi final", "semi", "quarterfinal", "quarter final",
+        "cuarto", "cuartos", "clasificatoria", "clasificacion", "serie",
+        "series", "heat", "heats", "ronda", "round"
+    ]
+    if any(tok in s for tok in non_final_tokens):
+        return False
+    return (
+        s == "final"
+        or s.startswith("final ")
+        or s.endswith(" final")
+        or f" {s} ".find(" final ") >= 0
+        or s.startswith("finals")
+    )
+
+
+def filter_liveheats_rounds(norm: pd.DataFrame, mode: str = "auto_final") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Filtra rondas no finales cuando el CSV trae columna Round/Ronda.
+
+    mode:
+    - auto_final: si hay columna Round, conserva solo finales. Si no hay Round, no filtra.
+    - final_only: exige Round=Final; si no hay columna Round, no filtra.
+    - all: no filtra.
+    """
+    rows = []
+    def add(item, value, detail=""):
+        rows.append({"control": item, "value": value, "detail": detail})
+
+    add("filas_antes_filtro_rondas", len(norm))
+    has_round = "has_round_col" in norm.columns and bool(norm["has_round_col"].fillna(False).any())
+    add("csv_con_columna_round", "Sí" if has_round else "No")
+    add("modo_filtro_rondas", mode)
+
+    if mode == "all" or not has_round or norm.empty:
+        add("filas_despues_filtro_rondas", len(norm))
+        add("filas_excluidas_por_ronda", 0)
+        return norm.copy(), pd.DataFrame(rows)
+
+    mask_final = norm["round"].apply(is_final_round_value)
+    kept = norm.loc[mask_final].copy()
+    excluded = norm.loc[~mask_final].copy()
+    if not excluded.empty:
+        ignored_rounds = ", ".join(sorted(excluded["round"].dropna().astype(str).unique())[:20])
+        ignored_divs = " | ".join(sorted(excluded["division"].dropna().astype(str).unique())[:20])
+    else:
+        ignored_rounds = ""
+        ignored_divs = ""
+    add("filas_despues_filtro_rondas", len(kept))
+    add("filas_excluidas_por_ronda", len(excluded), ignored_rounds)
+    add("primeras_pruebas_excluidas_por_ronda", excluded["division"].nunique() if not excluded.empty else 0, ignored_divs)
+    return kept, pd.DataFrame(rows)
 
 
 def scoring_points(position: int, points_table: Dict[int, int]) -> int:
@@ -181,16 +268,13 @@ def _choose_base_points(row, ordinal: int, is_team: bool, points_table: Dict[int
     live = row.get("liveheats_points", pd.NA)
     has_live = not pd.isna(live)
     if score_source in ["auto", "liveheats"] and has_live:
-        # LiveHeats supplies the official pointscore, but in RFESS individual events
-        # only the first N real rows score. This prevents extra 1-point ties at
-        # Place 16 from counting as row 17/18 in individual events. Team events
-        # keep their LiveHeats pointscore, including official ties.
-        if not is_team:
-            place = row.get("place", pd.NA)
-            if individual_limit_mode == "ordinal" and ordinal > top_limit:
-                return 0, "LIVEHEATS_POINT_SCORE_FUERA_TOP_ORDINAL"
-            if individual_limit_mode == "place" and (pd.isna(place) or int(place) > top_limit):
-                return 0, "LIVEHEATS_POINT_SCORE_FUERA_TOP_PLACE"
+        # LiveHeats supplies the official pointscore, but the app still applies
+        # the same top-limit rule to every result type before the max-per-club rule.
+        place = row.get("place", pd.NA)
+        if individual_limit_mode == "ordinal" and ordinal > top_limit:
+            return 0, "LIVEHEATS_POINT_SCORE_FUERA_TOP_ORDINAL"
+        if individual_limit_mode == "place" and (pd.isna(place) or int(place) > top_limit):
+            return 0, "LIVEHEATS_POINT_SCORE_FUERA_TOP_PLACE"
         return int(live), "LIVEHEATS_POINT_SCORE"
     if score_source == "liveheats" and not has_live:
         return 0, "SIN_POINT_SCORE_LIVEHEATS"
@@ -202,10 +286,48 @@ def _choose_base_points(row, ordinal: int, is_team: bool, points_table: Dict[int
     return _points_from_table(row.get("place", pd.NA), ordinal, points_table, top_limit, individual_limit_mode), "TABLA_PUNTOS"
 
 
+def _apply_max_results_per_club(rows: List[dict], max_per_club: int) -> List[dict]:
+    """Aplica una regla simple RFESS: en cada prueba solo puntúan los N primeros resultados de cada club.
+
+    Se aplica igual a pruebas individuales y a equipos/relevos. La posición no se corre: si el
+    4.º resultado de un club está en zona de puntos, queda a 0 y no se reasignan puntos al siguiente.
+    """
+    club_counts = {}
+    out = []
+    try:
+        max_per_club = int(max_per_club)
+    except Exception:
+        max_per_club = 3
+    for row in rows:
+        r = dict(row)
+        club = r.get("club", "")
+        base = int(r.get("base_points", 0) or 0)
+        if base > 0 and max_per_club > 0:
+            club_counts[club] = club_counts.get(club, 0) + 1
+            if club_counts[club] > max_per_club:
+                r["rfess_points"] = 0
+                r["adjustment_reason"] = "CUARTO_RESULTADO_CLUB_PRUEBA"
+            else:
+                r["rfess_points"] = base
+                if str(r.get("adjustment_reason", "")).startswith("EQUIPO"):
+                    r["adjustment_reason"] = "OK"
+        else:
+            r["rfess_points"] = 0
+        out.append(r)
+    return out
+
+
 def build_scored_rows(norm: pd.DataFrame, points_table: Optional[Dict[int, int]] = None,
                       max_per_club_individual: int = 3, top_limit: int = 16,
                       individual_limit_mode: str = "ordinal", score_source: str = "auto") -> pd.DataFrame:
     """Build RFESS points by result row.
+
+    Regla simplificada RFESS usada por la app:
+    - Cada prueba se ordena por puesto.
+    - Se asignan puntos por posición o pointscore.
+    - Solo puntúan los N primeros resultados de cada club en esa prueba, tanto si son
+      individuales como si son equipos/relevos. El 4.º resultado del mismo club queda a 0
+      y no se corre la puntuación al siguiente.
 
     score_source:
     - auto: use LiveHeats Club pointscore points when present; fallback to the points table.
@@ -230,63 +352,67 @@ def build_scored_rows(norm: pd.DataFrame, points_table: Optional[Dict[int, int]]
                     & (g["entity"].map(norm_text) == g["club"].map(norm_text))
                 )
                 g = g.loc[~placeholder].copy()
-            # Collapse athlete rows into one team result per club/place/division_team.
+            # Collapse athlete rows into one result per club/place/team. This is only de-duplication
+            # for LiveHeats team CSVs; scoring rules are applied afterwards exactly like individual rows.
             team_cols = ["division", "category", "sex", "club", "place"]
             rows = []
             for keys, tg in g.groupby(team_cols, sort=False, dropna=False):
                 div, cat, sex, club, place = keys
                 tg2 = tg.copy().sort_values(["place", "row_order"], na_position="last")
-                # The team pointscore normally appears only on the first athlete row of that team.
                 live_values = pd.to_numeric(tg2["liveheats_points"], errors="coerce").dropna()
                 first = tg2.iloc[0].copy()
                 if len(live_values):
                     first["liveheats_points"] = live_values.iloc[0]
                 else:
                     first["liveheats_points"] = pd.NA
-                base, source_reason = _choose_base_points(first, 1, True, points_table, top_limit, individual_limit_mode, score_source)
-                if base == 0 and pd.isna(place):
-                    reason = "EQUIPO_SIN_POSICION"
-                elif base == 0:
-                    reason = "EQUIPO_SIN_PUNTOS"
-                else:
-                    reason = "EQUIPO_RELEVO_CLUB"
                 rows.append({
                     "division": div, "category": cat, "sex": sex, "club": club, "place": place,
                     "entity": club, "bib": first.get("bib", pd.NA), "is_team_event": True,
-                    "rfess_points": base, "base_points": base, "liveheats_points": first.get("liveheats_points", pd.NA),
-                    "score_source": source_reason, "adjustment_reason": reason, "row_count": len(tg2)
+                    "rfess_points": 0, "base_points": 0, "liveheats_points": first.get("liveheats_points", pd.NA),
+                    "score_source": "", "adjustment_reason": "", "row_count": len(tg2),
+                    "row_order": int(pd.to_numeric(tg2["row_order"], errors="coerce").min())
                 })
-            scored_parts.append(pd.DataFrame(rows))
+            rows = sorted(rows, key=lambda x: (999999 if pd.isna(x.get("place", pd.NA)) else float(x.get("place")), x.get("row_order", 999999)))
+            rescored = []
+            for ordinal, rr in enumerate(rows, start=1):
+                base, source_reason = _choose_base_points(rr, ordinal, False, points_table, top_limit, individual_limit_mode, score_source)
+                if base == 0 and pd.isna(rr.get("place", pd.NA)):
+                    reason = "SIN_POSICION"
+                elif base == 0:
+                    reason = "FUERA_ZONA_PUNTOS" if source_reason != "SIN_POINT_SCORE_LIVEHEATS" else "SIN_POINT_SCORE_LIVEHEATS"
+                else:
+                    reason = "OK"
+                rr["base_points"] = base
+                rr["rfess_points"] = base
+                rr["score_source"] = source_reason
+                rr["adjustment_reason"] = reason
+                rescored.append(rr)
+            rescored = _apply_max_results_per_club(rescored, max_per_club_individual)
+            for rr in rescored:
+                rr.pop("row_order", None)
+            scored_parts.append(pd.DataFrame(rescored))
         else:
-            club_counts = {}
             rows = []
             ordinal = 0
             for _, r in g.iterrows():
                 ordinal += 1
                 base, source_reason = _choose_base_points(r, ordinal, False, points_table, top_limit, individual_limit_mode, score_source)
                 reason = "OK" if base > 0 else "SIN_PUNTOS"
-                club = r["club"]
-                if base > 0:
-                    club_counts[club] = club_counts.get(club, 0) + 1
-                    if club_counts[club] > max_per_club_individual:
-                        pts = 0
-                        reason = "CUARTO_DEPORTISTA_CLUB_PRUEBA_INDIVIDUAL"
-                    else:
-                        pts = base
-                else:
-                    pts = 0
+                if base <= 0:
                     if pd.isna(r.get("place", pd.NA)):
                         reason = "SIN_POSICION"
                     elif source_reason == "SIN_POINT_SCORE_LIVEHEATS":
                         reason = "SIN_POINT_SCORE_LIVEHEATS"
                     else:
                         reason = "FUERA_ZONA_PUNTOS"
+                club = r["club"]
                 rows.append({
                     "division": r["division"], "category": r["category"], "sex": r["sex"], "club": club,
                     "place": r["place"], "entity": r["entity"], "bib": r["bib"], "is_team_event": False,
-                    "rfess_points": pts, "base_points": base, "liveheats_points": r.get("liveheats_points", pd.NA),
+                    "rfess_points": base, "base_points": base, "liveheats_points": r.get("liveheats_points", pd.NA),
                     "score_source": source_reason, "adjustment_reason": reason, "row_count": 1
                 })
+            rows = _apply_max_results_per_club(rows, max_per_club_individual)
             scored_parts.append(pd.DataFrame(rows))
     return pd.concat(scored_parts, ignore_index=True) if scored_parts else pd.DataFrame()
 
@@ -368,7 +494,7 @@ def make_quality_report(norm: pd.DataFrame, scored: pd.DataFrame, blocks: pd.Dat
     add("pruebas_equipo_relevo", int(norm.groupby("division")["is_team_event"].any().sum()))
     add("pruebas_individuales", int((~norm.groupby("division")["is_team_event"].any()).sum()))
     add("filas_con_liveheats_pointscore", int(pd.to_numeric(norm["liveheats_points"], errors="coerce").notna().sum()))
-    add("ajustes_4o_deportista", int((scored["adjustment_reason"] == "CUARTO_DEPORTISTA_CLUB_PRUEBA_INDIVIDUAL").sum()) if not scored.empty else 0)
+    add("ajustes_4o_resultado_club", int((scored["adjustment_reason"] == "CUARTO_RESULTADO_CLUB_PRUEBA").sum()) if not scored.empty else 0)
     add("clasificaciones_definidas", len(blocks))
     unknown_cats = sorted([c for c in norm["category"].unique() if str(c).startswith("sin_")])
     unknown_sex = sorted([s for s in norm["sex"].unique() if str(s).startswith("sin_")])

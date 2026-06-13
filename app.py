@@ -16,10 +16,11 @@ from rfess_engine_open import (
     parse_blocks_text,
     read_liveheats_csv,
     apply_no_score_overrides,
+    filter_liveheats_rounds,
 )
 from rfess_pdf_open import build_pdf
 
-APP_VERSION = "Versión definitiva limpia"
+APP_VERSION = "v7 · finales + equipos corregidos"
 ALL_SEXES_DEFAULT = ["femenina", "masculina", "mixta"]
 BASE_DIR = Path(__file__).resolve().parent
 LOGO_PATH = BASE_DIR / "rfess_logo.jpg"
@@ -175,6 +176,134 @@ def detected_key(categories, sexes):
     return "|".join(categories) + "__" + "|".join(sexes)
 
 
+
+def _norm_column_map(df: pd.DataFrame) -> dict:
+    return {str(c).strip().lower().replace(" ", "_"): c for c in df.columns}
+
+
+def _get_col(df: pd.DataFrame, candidates: list[str]):
+    # Búsqueda tolerante: exacta normalizada y por contenido.
+    simple = _norm_column_map(df)
+    for c in candidates:
+        key = c.strip().lower().replace(" ", "_")
+        if key in simple:
+            return simple[key]
+    def light(x):
+        import unicodedata, re
+        x = "" if x is None else str(x)
+        x = "".join(ch for ch in unicodedata.normalize("NFKD", x) if not unicodedata.combining(ch))
+        x = re.sub(r"[^a-z0-9]+", " ", x.lower()).strip()
+        return x
+    normed = {light(c): c for c in df.columns}
+    for cand in candidates:
+        lc = light(cand)
+        if lc in normed:
+            return normed[lc]
+    return None
+
+
+def _is_final_value_for_app(value) -> bool:
+    s = norm_text_local(value)
+    if not s or s in {"nan", "none"}:
+        return False
+    blocked = ["semifinal", "semi final", "semi", "quarterfinal", "quarter final", "cuarto", "cuartos", "serie", "series", "heat", "heats", "ronda", "round"]
+    if any(b in s for b in blocked):
+        return False
+    return s == "final" or s.startswith("final ") or s.endswith(" final") or " final " in f" {s} "
+
+
+def norm_text_local(value) -> str:
+    import unicodedata, re
+    value = "" if value is None else str(value)
+    value = "".join(ch for ch in unicodedata.normalize("NFKD", value) if not unicodedata.combining(ch))
+    value = value.lower().replace("'", " ").replace("’", " ")
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def infer_completed_divisions_from_results(results_df: pd.DataFrame) -> tuple[set[str], pd.DataFrame]:
+    """Detecta automáticamente pruebas con final realmente disputada.
+
+    Criterio principal:
+    - Debe existir Round/Ronda = Final.
+    - Debe haber posiciones válidas.
+    - Si existen columnas de resultado/marca/score, al menos una fila de la final debe tener
+      evidencia de resultado real. Esto evita contar finales creadas en LiveHeats como
+      parrilla provisional con Total=0 y Score vacío.
+    """
+    rows = []
+    completed = set()
+    if results_df is None or results_df.empty:
+        return completed, pd.DataFrame(rows)
+
+    div_col = _get_col(results_df, ["Division", "Event", "Prueba"])
+    round_col = _get_col(results_df, ["Round", "Ronda", "Fase"])
+    place_col = _get_col(results_df, ["Place", "Posicion", "Posición", "Pos"])
+    if not div_col:
+        return completed, pd.DataFrame([{
+            "division": "", "estado": "no_detectable", "motivo": "No se encontró columna Division/Prueba", "filas_final": 0, "evidencia_resultado": "No"
+        }])
+
+    if not round_col:
+        # Si no hay ronda, este archivo no sirve para distinguir finales. No filtra.
+        return set(results_df[div_col].dropna().astype(str).unique()), pd.DataFrame([{
+            "division": "*", "estado": "sin_columna_round", "motivo": "El CSV no tiene Round/Ronda; se consideran sus pruebas como completadas", "filas_final": len(results_df), "evidencia_resultado": "No aplica"
+        }])
+
+    candidate_result_cols = []
+    for c in results_df.columns:
+        lc = norm_text_local(c)
+        if c in {div_col, round_col, place_col}:
+            continue
+        if (
+            lc == "total" or lc.startswith("score") or "result" in lc or "time" in lc or
+            "tiempo" in lc or "marca" in lc or "points" in lc or "pointscore" in lc
+        ):
+            candidate_result_cols.append(c)
+
+    df = results_df.copy()
+    final_mask = df[round_col].apply(_is_final_value_for_app)
+    for division, group in df.groupby(div_col, dropna=False):
+        division_s = str(division)
+        final_rows = group.loc[final_mask.reindex(group.index).fillna(False)].copy()
+        if final_rows.empty:
+            rows.append({"division": division_s, "estado": "excluida", "motivo": "Sin filas de Final", "filas_final": 0, "evidencia_resultado": "No"})
+            continue
+        valid_place = True
+        if place_col:
+            valid_place = pd.to_numeric(final_rows[place_col], errors="coerce").notna().any()
+        evidence = False
+        evidence_cols_used = []
+        for c in candidate_result_cols:
+            ser = final_rows[c]
+            if pd.api.types.is_numeric_dtype(ser):
+                nums = pd.to_numeric(ser, errors="coerce")
+                if nums.notna().any() and (nums.fillna(0) != 0).any():
+                    evidence = True
+                    evidence_cols_used.append(str(c))
+            else:
+                txt = ser.dropna().astype(str).map(str.strip)
+                txt = txt[~txt.str.lower().isin(["", "nan", "none", "0", "0.0"])]
+                if not txt.empty:
+                    evidence = True
+                    evidence_cols_used.append(str(c))
+        if not candidate_result_cols:
+            # CSV pobre: con Final + Place es lo máximo que podemos inferir.
+            evidence = True
+            evidence_cols_used.append("Final+Place")
+
+        if valid_place and evidence:
+            completed.add(division_s)
+            rows.append({
+                "division": division_s, "estado": "incluida", "motivo": "Final con evidencia de resultado", "filas_final": len(final_rows), "evidencia_resultado": ", ".join(evidence_cols_used[:4])
+            })
+        else:
+            rows.append({
+                "division": division_s, "estado": "excluida", "motivo": "Final provisional o sin evidencia de resultado", "filas_final": len(final_rows), "evidencia_resultado": "No"
+            })
+    return completed, pd.DataFrame(rows)
+
+
 inject_css()
 render_hero()
 
@@ -183,7 +312,7 @@ with st.sidebar:
     leaderboard_file = st.file_uploader(
         "Archivo obligatorio: “Clasificaciones finales de la categoría (CSV)”",
         type=["csv"],
-        help="Es el archivo principal del informe de LiveHeats que actúa como leaderboard final.",
+        help="Recomendado: Clasificaciones finales de la categoría (CSV). Si subes Detalle de resultados, activa el filtro de finales para no puntuar series/semifinales.",
     )
     results_file = st.file_uploader(
         "Archivo opcional: “Detalle de resultados y puntajes (CSV)”",
@@ -198,7 +327,7 @@ with st.sidebar:
 
     st.markdown("## 2. Reglas RFESS")
     max_per_club = st.number_input(
-        "Máximo de deportistas por club en pruebas individuales",
+        "Máximo de resultados por club en cada prueba",
         min_value=1,
         max_value=10,
         value=3,
@@ -220,13 +349,29 @@ with st.sidebar:
         "Calcular con tabla RFESS": "table",
     }[score_source_label]
     limit_mode = st.selectbox(
-        "Modo de corte top en individuales cuando no hay pointscore",
-        ["ordinal", "place"],
+        "Modo de corte top cuando no hay pointscore",
+        ["place", "ordinal"],
         index=0,
-        help="ordinal = top 16 por orden del listado. place = usa la posición oficial “Place”.",
+        help="Recomendado: place. place = usa la posición oficial “Place” y respeta empates. ordinal = top 16 por orden físico del listado.",
     )
+
+    st.markdown("## 3. Filtro de finales")
+    round_filter_label = st.selectbox(
+        "Qué hacer si el CSV trae columna Round/Ronda",
+        [
+            "Recomendado: contar solo Final",
+            "No filtrar rondas",
+        ],
+        index=0,
+        help="Si usas Detalle de resultados, esto evita que puntúen series, semifinales o cuartos de pruebas aún no terminadas.",
+    )
+    round_filter_mode = {
+        "Recomendado: contar solo Final": "auto_final",
+        "No filtrar rondas": "all",
+    }[round_filter_label]
+
     st.markdown(
-        '<div class="mini-note">Regla habitual RFESS: máximo 3 deportistas por club solo en pruebas individuales. En relevos/equipos el club puntúa normal.</div>',
+        '<div class="mini-note">Regla simplificada: en cada prueba solo puntúan los 3 primeros resultados de cada club, sea individual o relevo/equipo. A partir del 4.º resultado del mismo club, 0 puntos y no se corre la puntuación.</div>',
         unsafe_allow_html=True,
     )
 
@@ -246,11 +391,83 @@ if not leaderboard_file:
 
 aliases = load_aliases(aliases_file)
 raw = read_liveheats_csv(leaderboard_file)
-norm = normalize_liveheats(raw, aliases=aliases)
-scored = build_scored_rows(norm, DEFAULT_POINTS, int(max_per_club), int(top_limit), limit_mode, score_source)
-results_overrides = pd.DataFrame()
+raw_cols_norm = {norm_text_local(c) for c in raw.columns}
+mandatory_looks_like_results = any(c in raw_cols_norm for c in {"round", "ronda", "fase"})
+
+detailed_results = None
+completed_detection = pd.DataFrame()
+completed_divisions_from_detail = set()
 if results_file is not None:
     detailed_results = read_liveheats_csv(results_file)
+    completed_divisions_from_detail, completed_detection = infer_completed_divisions_from_results(detailed_results)
+
+norm_original = normalize_liveheats(raw, aliases=aliases)
+norm, round_filter_quality = filter_liveheats_rounds(norm_original, round_filter_mode)
+
+all_divisions_after_round_filter = sorted(norm["division"].dropna().astype(str).unique())
+
+with st.sidebar:
+    st.markdown("## 4. Pruebas que puntúan")
+    event_filter_mode_label = st.selectbox(
+        "Detección de pruebas finalizadas",
+        [
+            "Automática: detectar pruebas finalizadas",
+            "Manual: seleccionar pruebas",
+            "Sin filtro adicional",
+        ],
+        index=0,
+        help=(
+            "Recomendado: automática. Si el archivo principal es Clasificaciones finales de la categoría, "
+            "solo usa las pruebas incluidas ahí. Si además subes Detalle de resultados, intenta excluir finales provisionales sin marca/score."
+        ),
+    )
+    event_filter_mode = {
+        "Automática: detectar pruebas finalizadas": "auto",
+        "Manual: seleccionar pruebas": "manual",
+        "Sin filtro adicional": "all",
+    }[event_filter_mode_label]
+
+selected_divisions = all_divisions_after_round_filter
+auto_notes = []
+
+if event_filter_mode == "auto":
+    if detailed_results is not None and completed_divisions_from_detail:
+        # Intersección: nunca añadimos pruebas que no estén en el archivo principal.
+        selected_divisions = [d for d in all_divisions_after_round_filter if d in completed_divisions_from_detail]
+        auto_notes.append(f"Detección automática desde detalle de resultados: {len(selected_divisions)} prueba(s) incluidas de {len(all_divisions_after_round_filter)} presentes en el archivo principal.")
+        if not selected_divisions:
+            selected_divisions = all_divisions_after_round_filter
+            auto_notes.append("No se pudo cruzar ninguna prueba con el detalle; se conserva el archivo principal completo.")
+    else:
+        selected_divisions = all_divisions_after_round_filter
+        if mandatory_looks_like_results:
+            auto_notes.append("El archivo principal parece Detalle de resultados. Se aplica el filtro de rondas; para máxima seguridad sube como principal el CSV 'Clasificaciones finales de la categoría'.")
+        else:
+            auto_notes.append("El archivo principal no trae Round/Ronda: se considera que sus pruebas son las ya publicadas/finalizadas por LiveHeats.")
+elif event_filter_mode == "manual":
+    with st.sidebar:
+        selected_divisions = st.multiselect(
+            "Selecciona solo pruebas completadas",
+            options=all_divisions_after_round_filter,
+            default=all_divisions_after_round_filter,
+            help="Para sacar clasificaciones parciales de un día, deja marcadas solo las pruebas cuya final ya se haya disputado.",
+        )
+else:
+    selected_divisions = all_divisions_after_round_filter
+    auto_notes.append("Sin filtro adicional de pruebas: se puntúa todo lo que haya pasado el filtro de ronda.")
+
+if mandatory_looks_like_results:
+    st.warning("Aviso: el archivo obligatorio parece ser 'Detalle de resultados' porque trae columna Round/Ronda. Para clasificaciones parciales es más seguro subir como archivo obligatorio 'Clasificaciones finales de la categoría (CSV)' y usar el detalle solo como apoyo.")
+
+if selected_divisions:
+    norm = norm[norm["division"].astype(str).isin(selected_divisions)].copy()
+else:
+    st.error("No hay pruebas seleccionadas para puntuar.")
+    st.stop()
+
+scored = build_scored_rows(norm, DEFAULT_POINTS, int(max_per_club), int(top_limit), limit_mode, score_source)
+results_overrides = pd.DataFrame()
+if detailed_results is not None:
     scored, results_overrides = apply_no_score_overrides(scored, detailed_results)
 
 categories = sorted([c for c in norm["category"].dropna().unique() if c != "sin_categoria"])
@@ -261,10 +478,20 @@ key = detected_key(categories, sexes_ordered)
 if "builder_detected_key" not in st.session_state or st.session_state["builder_detected_key"] != key:
     st.session_state["builder_detected_key"] = key
     initial_sexes = sexes_ordered if sexes_ordered else ALL_SEXES_DEFAULT
+    # Si el CSV mezcla absoluto + máster, el PDF RFESS de clasificación general
+    # suele referirse a la categoría absoluta. Por seguridad, el bloque inicial
+    # usa “absoluto” cuando existe; el usuario puede añadir máster u otras
+    # categorías desde el constructor visual.
+    if "absoluto" in categories:
+        initial_categories_value = "absoluto"
+        initial_block_name = "General absoluto"
+    else:
+        initial_categories_value = "*"
+        initial_block_name = "General campeonato"
     st.session_state["visual_blocks"] = [{
         "usar": True,
-        "block": "General campeonato",
-        "categories": "*",
+        "block": initial_block_name,
+        "categories": initial_categories_value,
         "sexes": sexes_label(initial_sexes),
     }]
 
@@ -275,6 +502,16 @@ c2.metric("Pruebas", norm["division"].nunique())
 c3.metric("Categorías", len(categories))
 c4.metric("Clubes", norm["club"].nunique())
 
+filas_excluidas_ronda = 0
+if not round_filter_quality.empty and "filas_excluidas_por_ronda" in round_filter_quality["control"].values:
+    try:
+        filas_excluidas_ronda = int(round_filter_quality.loc[round_filter_quality["control"] == "filas_excluidas_por_ronda", "value"].iloc[0])
+    except Exception:
+        filas_excluidas_ronda = 0
+
+if filas_excluidas_ronda > 0:
+    st.warning(f"Filtro de finales activo: se han excluido {filas_excluidas_ronda} fila(s) de rondas no finales para evitar puntuar series/semifinales/cuartos.")
+
 st.markdown(
     f"""
     <div class="card">
@@ -282,6 +519,9 @@ st.markdown(
         <p><strong>Categorías detectadas:</strong> {', '.join(categories) if categories else '-'}</p>
         <p><strong>Sexos detectados:</strong> {', '.join(sexes_ordered) if sexes_ordered else '-'}</p>
         <p><strong>Columna de puntos LiveHeats:</strong> {'Sí' if (norm['liveheats_points'].notna().sum() > 0) else 'No'}</p>
+        <p><strong>Pruebas seleccionadas para puntuar:</strong> {norm['division'].nunique()} de {len(all_divisions_after_round_filter)}</p>
+        <p><strong>Filas excluidas por no ser final:</strong> {filas_excluidas_ronda}</p>
+        <p><strong>Detección automática:</strong> {' | '.join(auto_notes) if auto_notes else '-'}</p>
         <p><strong>Ajustes desde detalle de resultados:</strong> {len(results_overrides)} registro(s)</p>
     </div>
     """,
@@ -293,6 +533,10 @@ with st.expander("Ver pruebas detectadas"):
         filas=("division", "size"), equipo=("is_team_event", "max")
     ).reset_index()
     st.dataframe(divisions, use_container_width=True, hide_index=True)
+
+if not completed_detection.empty:
+    with st.expander("Auditoría de detección de pruebas finalizadas"):
+        st.dataframe(completed_detection, use_container_width=True, hide_index=True)
 
 st.markdown("## Constructor visual de clasificaciones")
 st.caption("Añade las clasificaciones con botones rápidos o creando una a medida.")
@@ -398,7 +642,7 @@ if blocks.empty:
 st.info(f"Se generarán {len(blocks)} clasificación(es).")
 
 classifications = calculate_classifications(scored, blocks)
-quality = make_quality_report(norm, scored, blocks)
+quality = pd.concat([round_filter_quality, make_quality_report(norm, scored, blocks)], ignore_index=True)
 
 st.markdown("## Vista previa de resultados")
 if classifications.empty:
